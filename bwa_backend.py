@@ -3,6 +3,8 @@ from __future__ import annotations
 import operator
 import os
 import re
+import json
+import base64
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -16,7 +18,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
@@ -98,6 +101,8 @@ class State(TypedDict):
     # recency
     as_of: str
     recency_days: int
+    max_sections: int
+    include_images: bool
 
     # workers
     sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
@@ -109,11 +114,43 @@ class State(TypedDict):
 
     final: str
 
+OUTPUTS_DIR = Path("outputs")
+IMAGES_DIR = OUTPUTS_DIR / "images"
 
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOpenAI(model="gpt-4.1-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+LLM_MODEL = os.getenv("BWA_MODEL", "gpt-4o-mini")
+LLM_BASE_URL = os.getenv("BWA_BASE_URL", "https://api.openai.com/v1")
+LLM_API_KEY = OPENAI_API_KEY
+if not LLM_API_KEY:
+    raise ValueError("Set OPENAI_API_KEY in .env")
+
+llm = ChatOpenAI(
+    model=LLM_MODEL,
+    api_key=LLM_API_KEY,
+    base_url=LLM_BASE_URL,
+    temperature=0.2,
+)
+
+
+def _extract_json(text: str) -> dict:
+    content = (text or "").strip()
+    if not content:
+        raise ValueError("Empty model response.")
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
+    if match:
+        content = match.group(1).strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Try to salvage JSON object embedded in prose.
+        obj_match = re.search(r"\{[\s\S]*\}", content)
+        if obj_match:
+            return json.loads(obj_match.group(0))
+        raise
 
 # -----------------------------
 # 3) Router
@@ -133,13 +170,28 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
+    response = llm.invoke(
         [
-            SystemMessage(content=ROUTER_SYSTEM),
+            SystemMessage(
+                content=(
+                    ROUTER_SYSTEM
+                    + "\nReturn ONLY valid JSON with schema: "
+                    + '{"needs_research":false,"mode":"closed_book","reason":"","queries":[],"max_results_per_query":5}'
+                )
+            ),
             HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
         ]
     )
+    try:
+        decision = RouterDecision.model_validate(_extract_json(response.content))
+    except Exception:
+        decision = RouterDecision(
+            needs_research=True,
+            mode="hybrid",
+            reason="Fallback due to non-JSON router response",
+            queries=[state["topic"]],
+            max_results_per_query=5,
+        )
 
     if decision.mode == "open_book":
         recency_days = 7
@@ -205,17 +257,27 @@ Rules:
 
 def research_node(state: State) -> dict:
     queries = (state.get("queries") or [])[:10]
+    max_results = 6
+    try:
+        max_results = max(1, min(10, int(state.get("max_results_per_query", 6))))
+    except Exception:
+        max_results = 6
     raw: List[dict] = []
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        raw.extend(_tavily_search(q, max_results=max_results))
 
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
+    response = llm.invoke(
         [
-            SystemMessage(content=RESEARCH_SYSTEM),
+            SystemMessage(
+                content=(
+                    RESEARCH_SYSTEM
+                    + "\nReturn ONLY valid JSON with schema: "
+                    + '{"evidence":[{"title":"", "url":"", "published_at":null, "snippet":"", "source":""}]}'
+                )
+            ),
             HumanMessage(
                 content=(
                     f"As-of date: {state['as_of']}\n"
@@ -225,6 +287,10 @@ def research_node(state: State) -> dict:
             ),
         ]
     )
+    try:
+        pack = EvidencePack.model_validate(_extract_json(response.content))
+    except Exception:
+        pack = EvidencePack(evidence=[])
 
     dedup = {}
     for e in pack.evidence:
@@ -261,15 +327,20 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = planner.invoke(
+    response = llm.invoke(
         [
-            SystemMessage(content=ORCH_SYSTEM),
+            SystemMessage(
+                content=(
+                    ORCH_SYSTEM
+                    + "\nReturn ONLY valid JSON that exactly matches this schema: "
+                    + '{"blog_title":"","audience":"","tone":"","blog_kind":"explainer","constraints":[],"tasks":[{"id":1,"title":"","goal":"","bullets":[""],"target_words":250,"tags":[],"requires_research":false,"requires_citations":false,"requires_code":false}]}'
+                )
+            ),
             HumanMessage(
                 content=(
                     f"Topic: {state['topic']}\n"
@@ -281,6 +352,22 @@ def orchestrator_node(state: State) -> dict:
             ),
         ]
     )
+    try:
+        plan = Plan.model_validate(_extract_json(response.content))
+    except Exception:
+        plan = Plan(
+            blog_title=f"{state['topic'].strip().title()}",
+            audience="Developers",
+            tone="Clear and practical",
+            blog_kind="explainer" if mode != "open_book" else "news_roundup",
+            constraints=[],
+            tasks=[
+                Task(id=1, title="Introduction", goal="Set context for the topic", bullets=["What it is", "Why it matters", "What this blog covers"], target_words=180),
+                Task(id=2, title="Core Concepts", goal="Explain key ideas", bullets=["Main components", "How it works", "Common terms"], target_words=260),
+                Task(id=3, title="Practical Steps", goal="Show actionable guidance", bullets=["Step-by-step approach", "Tips", "Pitfalls"], target_words=260),
+                Task(id=4, title="Conclusion", goal="Summarize and suggest next steps", bullets=["Recap", "When to use", "Next actions"], target_words=160),
+            ],
+        )
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
@@ -292,6 +379,8 @@ def orchestrator_node(state: State) -> dict:
 # -----------------------------
 def fanout(state: State):
     assert state["plan"] is not None
+    max_sections = state.get("max_sections", 6)
+    tasks = state["plan"].tasks[: max(1, int(max_sections))]
     return [
         Send(
             "worker",
@@ -305,7 +394,7 @@ def fanout(state: State):
                 "evidence": [e.model_dump() for e in state.get("evidence", [])],
             },
         )
-        for task in state["plan"].tasks
+        for task in tasks
     ]
 
 # -----------------------------
@@ -400,14 +489,22 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
+    if not state.get("include_images", True):
+        return {"md_with_placeholders": state["merged_md"], "image_specs": []}
+
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
 
-    image_plan = planner.invoke(
+    response = llm.invoke(
         [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            SystemMessage(
+                content=(
+                    DECIDE_IMAGES_SYSTEM
+                    + "\nReturn ONLY valid JSON with schema: "
+                    + '{"md_with_placeholders":"","images":[{"placeholder":"[[IMAGE_1]]","filename":"diagram.png","alt":"","caption":"","prompt":"","size":"1024x1024","quality":"medium"}]}'
+                )
+            ),
             HumanMessage(
                 content=(
                     f"Blog kind: {plan.blog_kind}\n"
@@ -418,6 +515,48 @@ def decide_images(state: State) -> dict:
             ),
         ]
     )
+    try:
+        image_plan = GlobalImagePlan.model_validate(_extract_json(response.content))
+    except Exception:
+        image_plan = GlobalImagePlan(md_with_placeholders=merged_md, images=[])
+
+    # Guarantee at least one image for longer blogs in demo mode.
+    # This avoids silent "no-image" outputs when the planner returns images=[].
+    if not image_plan.images:
+        approx_words = len(re.findall(r"\w+", merged_md))
+        if approx_words >= 700:
+            fallback_placeholder = "[[IMAGE_1]]"
+            md_with_ph = merged_md
+            if fallback_placeholder not in md_with_ph:
+                first_h2 = re.search(r"\n##\s+", md_with_ph)
+                if first_h2:
+                    insert_at = first_h2.start()
+                    md_with_ph = (
+                        md_with_ph[:insert_at]
+                        + f"\n\n{fallback_placeholder}\n\n"
+                        + md_with_ph[insert_at:]
+                    )
+                else:
+                    md_with_ph = md_with_ph + f"\n\n{fallback_placeholder}\n"
+
+            image_plan = GlobalImagePlan(
+                md_with_placeholders=md_with_ph,
+                images=[
+                    ImageSpec(
+                        placeholder=fallback_placeholder,
+                        filename=f"{_safe_slug(state['topic'])}_overview.png",
+                        alt="Technical overview diagram",
+                        caption="Conceptual diagram summarizing the main flow discussed in this article.",
+                        prompt=(
+                            f"Create a clean technical diagram for a blog titled '{state['topic']}'. "
+                            "Use a modern flat style, light background, dark readable labels, arrows showing flow, "
+                            "and 4-6 key components. No brand logos, no watermarks."
+                        ),
+                        size="1536x1024",
+                        quality="medium",
+                    )
+                ],
+            )
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -425,52 +564,30 @@ def decide_images(state: State) -> dict:
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
+def _openai_generate_image_bytes(prompt: str, size: str = "1536x1024", quality: str = "medium") -> bytes:
     """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
+    Returns raw image bytes generated by OpenAI image API.
+    Requires: OPENAI_API_KEY
     """
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+        raise RuntimeError("OPENAI_API_KEY is not set.")
 
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
+    client = OpenAI(api_key=api_key)
+    image_model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    resp = client.images.generate(
+        model=image_model,
+        prompt=prompt,
+        size=size,
+        quality=quality,
     )
 
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
+    if not resp.data or not getattr(resp.data[0], "b64_json", None):
+        raise RuntimeError("No image bytes returned by OpenAI images API.")
 
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    return base64.b64decode(resp.data[0].b64_json)
 
 
 def _safe_slug(title: str) -> str:
@@ -490,10 +607,12 @@ def generate_and_place_images(state: State) -> dict:
     # If no images requested, just write merged markdown
     if not image_specs:
         filename = f"{_safe_slug(plan.blog_title)}.md"
-        Path(filename).write_text(md, encoding="utf-8")
+        OUTPUTS_DIR.mkdir(exist_ok=True)
+        (OUTPUTS_DIR / filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
-    images_dir = Path("images")
+    OUTPUTS_DIR.mkdir(exist_ok=True)
+    images_dir = IMAGES_DIR
     images_dir.mkdir(exist_ok=True)
 
     for spec in image_specs:
@@ -504,7 +623,11 @@ def generate_and_place_images(state: State) -> dict:
         # generate only if needed
         if not out_path.exists():
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _openai_generate_image_bytes(
+                    spec["prompt"],
+                    size=spec.get("size", "1536x1024"),
+                    quality=spec.get("quality", "medium"),
+                )
                 out_path.write_bytes(img_bytes)
             except Exception as e:
                 # graceful fallback: keep doc usable
@@ -517,11 +640,11 @@ def generate_and_place_images(state: State) -> dict:
                 md = md.replace(placeholder, prompt_block)
                 continue
 
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        img_md = f"![{spec['alt']}](outputs/images/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
     filename = f"{_safe_slug(plan.blog_title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
+    (OUTPUTS_DIR / filename).write_text(md, encoding="utf-8")
     return {"final": md}
 
 # build reducer subgraph
@@ -555,4 +678,3 @@ g.add_edge("reducer", END)
 
 app = g.compile()
 app
-

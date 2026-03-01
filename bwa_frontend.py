@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import zipfile
 from datetime import date
@@ -16,6 +15,9 @@ import streamlit as st
 # Import your compiled LangGraph app
 # -----------------------------
 from bwa_backend import app
+
+OUTPUTS_DIR = Path("outputs")
+IMAGES_DIR = OUTPUTS_DIR / "images"
 
 
 # -----------------------------
@@ -57,17 +59,21 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     Yields ("updates"/"values"/"final", payload).
     """
     try:
-        for step in graph_app.stream(inputs, stream_mode="updates"):
-            yield ("updates", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
+        last_values = None
+        saw_values = False
+        for step in graph_app.stream(inputs, stream_mode="values"):
+            saw_values = True
+            last_values = step
+            yield ("values", step)
+        if saw_values:
+            yield ("final", last_values if isinstance(last_values, dict) else {})
+            return
     except Exception:
         pass
 
     try:
-        for step in graph_app.stream(inputs, stream_mode="values"):
-            yield ("values", step)
+        for step in graph_app.stream(inputs, stream_mode="updates"):
+            yield ("updates", step)
         out = graph_app.invoke(inputs)
         yield ("final", out)
         return
@@ -164,8 +170,8 @@ def list_past_blogs() -> List[Path]:
     Returns .md files in current working directory, newest first.
     Filters out obvious non-blog markdown files if needed.
     """
-    cwd = Path(".")
-    files = [p for p in cwd.glob("*.md") if p.is_file()]
+    OUTPUTS_DIR.mkdir(exist_ok=True)
+    files = [p for p in OUTPUTS_DIR.glob("*.md") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
 
@@ -415,7 +421,7 @@ if out:
                 mime="text/markdown",
             )
 
-            bundle = bundle_zip(final_md, md_filename, Path("images"))
+            bundle = bundle_zip(final_md, md_filename, IMAGES_DIR)
             st.download_button(
                 "📦 Download Bundle (MD + images)",
                 data=bundle,
@@ -427,7 +433,7 @@ if out:
     with tab_images:
         st.subheader("Images")
         specs = out.get("image_specs") or []
-        images_dir = Path("images")
+        images_dir = IMAGES_DIR
 
         if not specs and not images_dir.exists():
             st.info("No images generated for this blog.")
