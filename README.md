@@ -4,6 +4,8 @@
 
 Built because agentic systems need more than just a single LLM call. They need to **think before they act** — breaking a goal into structured tasks, routing intelligently, parallelising work, and synthesising a coherent result. This project is the embodiment of that idea, applied to technical content creation.
 
+This implementation was developed from a learning baseline and then extended with production-style structure, API surface, stronger fallbacks, and a full end-to-end output pipeline.
+
 ---
 
 ## Why It Was Built
