@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import zipfile
+import sys
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -11,12 +12,16 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 import pandas as pd
 import streamlit as st
 
+# Ensure project root is importable when launching from ui/ path.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 # -----------------------------
 # Import your compiled LangGraph app
 # -----------------------------
 from app.graph import graph_app
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
 
@@ -250,6 +255,8 @@ with st.sidebar:
                     "evidence": [],        # old files don't include evidence
                     "image_specs": [],     # optional (not persisted)
                     "final": md_text,      # markdown body
+                    "loaded_from_file": True,
+                    "source_file": str(selected_md_file),
                 }
                 # also update the topic input to the title (best-effort) without changing UI
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
@@ -342,7 +349,15 @@ if out:
         st.subheader("Plan")
         plan_obj = out.get("plan")
         if not plan_obj:
-            st.info("No plan found in output.")
+            if out.get("loaded_from_file"):
+                src = out.get("source_file", "selected markdown")
+                word_count = len(re.findall(r"\w+", out.get("final") or ""))
+                st.info(
+                    f"Loaded from `{src}`. This file contains final markdown only, so plan/evidence metadata is not available."
+                )
+                st.write(f"**Approx word count:** {word_count}")
+            else:
+                st.info("No plan found in output.")
         else:
             if hasattr(plan_obj, "model_dump"):
                 plan_dict = plan_obj.model_dump()

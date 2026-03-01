@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
+# Backward-compatible fallback for previous project layout:
+# /.../Blog Agent using Langgraph/.env
+load_dotenv(dotenv_path=ROOT_DIR.parent / ".env")
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
@@ -417,6 +420,11 @@ Grounding:
   For each supported claim, attach a Markdown link ([Source](URL)).
   If unsupported, write "Not found in provided sources."
 - If requires_citations==true (hybrid tasks): cite Evidence URLs for external claims.
+- If any Evidence URLs are provided, include at least 2 inline citations in the section body when making factual statements.
+- If Evidence URLs are provided, always end the section with:
+  ### Sources
+  - [Short title](URL)
+  - [Short title](URL)
 
 Code:
 - If requires_code==true, include at least one minimal snippet.
@@ -426,6 +434,7 @@ def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
+    allowed_urls = {e.url.strip() for e in evidence if e.url and e.url.strip()}
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
@@ -459,6 +468,32 @@ def worker_node(payload: dict) -> dict:
             ),
         ]
     ).content.strip()
+
+    # Remove common low-quality fallback text from model outputs.
+    section_md = re.sub(r"^\s*Not found in provided sources\.\s*$", "", section_md, flags=re.MULTILINE).strip()
+
+    # Keep only citations that exist in retrieved evidence.
+    def _replace_link(match: re.Match) -> str:
+        label = match.group(1)
+        url = match.group(2).strip()
+        return match.group(0) if url in allowed_urls else f"{label} (source unavailable)"
+
+    section_md = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _replace_link, section_md)
+
+    # Enforce citations for reliability when evidence exists.
+    if evidence:
+        has_links = bool(re.search(r"\[[^\]]+\]\(https?://[^)]+\)", section_md))
+        if not has_links:
+            sources_md = "\n".join(
+                f"- [{(e.title or 'Source')[:80]}]({e.url})"
+                for e in evidence[:3]
+                if e.url and e.url in allowed_urls
+            )
+            if sources_md:
+                section_md = section_md.rstrip() + "\n\n### Sources\n" + sources_md
+    else:
+        # No evidence available: drop orphan "Sources" headings if model added any.
+        section_md = re.sub(r"\n{0,2}### Sources[\s\S]*$", "", section_md).strip()
 
     return {"sections": [(task.id, section_md)]}
 
@@ -558,6 +593,20 @@ def decide_images(state: State) -> dict:
                 ],
             )
 
+    # Ensure every declared placeholder exists in markdown so placement is deterministic.
+    md_with_ph = image_plan.md_with_placeholders or merged_md
+    for img in image_plan.images:
+        ph = img.placeholder
+        if ph and ph not in md_with_ph:
+            # Insert missing placeholders right after title/introduction area.
+            first_h2 = re.search(r"\n##\s+", md_with_ph)
+            if first_h2:
+                insert_at = first_h2.start()
+                md_with_ph = md_with_ph[:insert_at] + f"\n\n{ph}\n\n" + md_with_ph[insert_at:]
+            else:
+                md_with_ph += f"\n\n{ph}\n"
+    image_plan.md_with_placeholders = md_with_ph
+
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
         "image_specs": [img.model_dump() for img in image_plan.images],
@@ -641,7 +690,11 @@ def generate_and_place_images(state: State) -> dict:
                 continue
 
         img_md = f"![{spec['alt']}](outputs/images/{filename})\n*{spec['caption']}*"
-        md = md.replace(placeholder, img_md)
+        if placeholder and placeholder in md:
+            md = md.replace(placeholder, img_md)
+        else:
+            # Safety: if placeholder missing, still include the generated image in output.
+            md += f"\n\n{img_md}\n"
 
     filename = f"{_safe_slug(plan.blog_title)}.md"
     (OUTPUTS_DIR / filename).write_text(md, encoding="utf-8")
