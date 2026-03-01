@@ -18,8 +18,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=".env")
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+ROOT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
@@ -114,7 +114,7 @@ class State(TypedDict):
 
     final: str
 
-OUTPUTS_DIR = Path("outputs")
+OUTPUTS_DIR = ROOT_DIR / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
 
 # -----------------------------
@@ -676,5 +676,5 @@ g.add_conditional_edges("orchestrator", fanout, ["worker"])
 g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
-app = g.compile()
-app
+graph_app = g.compile()
+app = graph_app

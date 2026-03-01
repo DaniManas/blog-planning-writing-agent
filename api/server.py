@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 import os
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
-from bwa_backend import app as graph_app
+from app.graph import graph_app
 
 
 class GenerateRequest(BaseModel):
@@ -30,6 +31,7 @@ class GenerateResponse(BaseModel):
 
 api = FastAPI(title="LangGraph Blog Agent API", version="1.0.0")
 LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "")
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 @api.get("/health")
@@ -80,7 +82,7 @@ def generate(payload: GenerateRequest, x_api_key: str | None = Header(default=No
         title.strip().lower().replace(" ", "_").replace("/", "_").replace("\\", "_")
         or "blog"
     )
-    output_path = f"outputs/{output_slug}.md"
+    output_path = str((ROOT_DIR / "outputs" / f"{output_slug}.md").relative_to(ROOT_DIR))
 
     return GenerateResponse(
         topic=payload.topic,

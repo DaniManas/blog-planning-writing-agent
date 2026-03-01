@@ -14,9 +14,10 @@ import streamlit as st
 # -----------------------------
 # Import your compiled LangGraph app
 # -----------------------------
-from bwa_backend import app
+from app.graph import graph_app
 
-OUTPUTS_DIR = Path("outputs")
+ROOT_DIR = Path(__file__).resolve().parent.parent
+OUTPUTS_DIR = ROOT_DIR / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
 
 
@@ -53,7 +54,7 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
     return buf.getvalue()
 
 
-def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
+def try_stream(graph_obj, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Stream graph progress if available; else invoke.
     Yields ("updates"/"values"/"final", payload).
@@ -61,7 +62,7 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     try:
         last_values = None
         saw_values = False
-        for step in graph_app.stream(inputs, stream_mode="values"):
+        for step in graph_obj.stream(inputs, stream_mode="values"):
             saw_values = True
             last_values = step
             yield ("values", step)
@@ -72,15 +73,15 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         pass
 
     try:
-        for step in graph_app.stream(inputs, stream_mode="updates"):
+        for step in graph_obj.stream(inputs, stream_mode="updates"):
             yield ("updates", step)
-        out = graph_app.invoke(inputs)
+        out = graph_obj.invoke(inputs)
         yield ("final", out)
         return
     except Exception:
         pass
 
-    out = graph_app.invoke(inputs)
+    out = graph_obj.invoke(inputs)
     yield ("final", out)
 
 
@@ -103,7 +104,10 @@ _CAPTION_LINE_RE = re.compile(r"^\*(?P<cap>.+)\*$")
 
 def _resolve_image_path(src: str) -> Path:
     src = src.strip().lstrip("./")
-    return Path(src).resolve()
+    p = Path(src)
+    if p.is_absolute():
+        return p
+    return (ROOT_DIR / p).resolve()
 
 
 def render_markdown_with_local_images(md: str):
@@ -300,7 +304,7 @@ if run_btn:
     current_state: Dict[str, Any] = {}
     last_node = None
 
-    for kind, payload in try_stream(app, inputs):
+    for kind, payload in try_stream(graph_app, inputs):
         if kind in ("updates", "values"):
             node_name = None
             if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
