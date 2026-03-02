@@ -97,6 +97,14 @@ The full Mermaid flow diagram is available in [`docs/FLOW_DIAGRAM.md`](docs/FLOW
 
 ---
 
+## Live Demo
+
+- Streamlit app: [https://bloggenie.streamlit.app/](https://bloggenie.streamlit.app/)
+- Generation is passcode-protected because the app uses limited OpenAI credits.
+- If you would like to test generation, please contact me for demo access.
+
+---
+
 ## Project Structure
 
 ```
