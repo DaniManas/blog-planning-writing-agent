@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import zipfile
 import sys
@@ -24,6 +25,12 @@ from app.graph import graph_app
 
 OUTPUTS_DIR = ROOT_DIR / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
+
+DEMO_PASSCODE = os.getenv("DEMO_PASSCODE", "").strip()
+try:
+    MAX_GENERATIONS_PER_SESSION = int(os.getenv("MAX_GENERATIONS_PER_SESSION", "2"))
+except Exception:
+    MAX_GENERATIONS_PER_SESSION = 2
 
 
 # -----------------------------
@@ -207,13 +214,22 @@ st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
 
 st.title("Blog Writing Agent")
 
+if "gen_count" not in st.session_state:
+    st.session_state["gen_count"] = 0
+
 with st.sidebar:
     st.header("Generate New Blog")
+    passcode_input = st.text_input("Demo Passcode", type="password")
     topic = st.text_area(
         "Topic",
         height=120,
     )
     as_of = st.date_input("As-of date", value=date.today())
+    max_sections = st.number_input("Max sections (cost control)", min_value=1, max_value=6, value=3, step=1)
+    include_images = st.checkbox("Generate images", value=True)
+    st.caption(
+        f"Session usage: {st.session_state['gen_count']}/{MAX_GENERATIONS_PER_SESSION} generations"
+    )
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
     # ✅ NEW: Past blogs list (keeps everything else intact)
@@ -285,6 +301,14 @@ def log(msg: str):
 
 
 if run_btn:
+    if DEMO_PASSCODE and passcode_input != DEMO_PASSCODE:
+        st.warning("Invalid passcode for demo generation.")
+        st.stop()
+
+    if st.session_state.get("gen_count", 0) >= MAX_GENERATIONS_PER_SESSION:
+        st.warning("Generation limit reached for this session.")
+        st.stop()
+
     if not topic.strip():
         st.warning("Please enter a topic.")
         st.stop()
@@ -298,6 +322,8 @@ if run_btn:
         "plan": None,
         "as_of": as_of.isoformat(),
         "recency_days": 7,
+        "max_sections": int(max_sections),
+        "include_images": bool(include_images),
         "sections": [],
         "merged_md": "",
         "md_with_placeholders": "",
@@ -338,6 +364,7 @@ if run_btn:
         elif kind == "final":
             out = payload
             st.session_state["last_out"] = out
+            st.session_state["gen_count"] = st.session_state.get("gen_count", 0) + 1
             status.update(label="✅ Done", state="complete", expanded=False)
             log("[final] received final state")
 
