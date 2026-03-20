@@ -51,7 +51,7 @@ def bundle_zip(md_text: str, md_filename: str, images_dir: Path) -> bytes:
         if images_dir.exists() and images_dir.is_dir():
             for p in images_dir.rglob("*"):
                 if p.is_file():
-                    z.write(p, arcname=str(p))
+                    z.write(p, arcname=f"images/{p.name}")
     return buf.getvalue()
 
 
@@ -62,7 +62,7 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for p in images_dir.rglob("*"):
             if p.is_file():
-                z.write(p, arcname=str(p))
+                z.write(p, arcname=p.name)
     return buf.getvalue()
 
 
@@ -232,50 +232,32 @@ with st.sidebar:
     )
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
-    # ✅ NEW: Past blogs list (keeps everything else intact)
     st.divider()
     st.subheader("Past blogs")
 
     past_files = list_past_blogs()
     if not past_files:
-        st.caption("No saved blogs found (*.md in current folder).")
-        selected_md_file = None
+        st.caption("No saved blogs yet.")
     else:
-        # Build labels from file name + (optional) parsed title
-        options: List[str] = []
-        file_by_label: Dict[str, Path] = {}
-        for p in past_files[:50]:
+        from datetime import datetime
+        for p in past_files[:20]:
             try:
                 md_text = read_md_file(p)
                 title = extract_title_from_md(md_text, p.stem)
             except Exception:
                 title = p.stem
-            label = f"{title}  ·  {p.name}"
-            options.append(label)
-            file_by_label[label] = p
-
-        selected_label = st.radio(
-            "Select a blog to load",
-            options=options,
-            index=0,
-            label_visibility="collapsed",
-        )
-        selected_md_file = file_by_label.get(selected_label)
-
-        if st.button("📂 Load selected blog"):
-            if selected_md_file:
-                md_text = read_md_file(selected_md_file)
-                # Load into session_state as if it were a run output
+                md_text = ""
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%b %d, %Y")
+            if st.button(f"📄 {title}", key=str(p), help=mtime, use_container_width=True):
                 st.session_state["last_out"] = {
-                    "plan": None,          # old files don't include plan
-                    "evidence": [],        # old files don't include evidence
-                    "image_specs": [],     # optional (not persisted)
-                    "final": md_text,      # markdown body
+                    "plan": None,
+                    "evidence": [],
+                    "image_specs": [],
+                    "final": md_text,
                     "loaded_from_file": True,
-                    "source_file": str(selected_md_file),
+                    "source_file": str(p),
                 }
-                # also update the topic input to the title (best-effort) without changing UI
-                st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
+                st.session_state["topic_prefill"] = title
 
     
 
@@ -353,7 +335,7 @@ if run_btn:
                 "needs_research": current_state.get("needs_research"),
                 "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
                 "evidence_count": len(current_state.get("evidence", []) or []),
-                "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
+                "tasks": len(p.tasks) if hasattr(p := (current_state.get("plan") or {}), "tasks") else len(p.get("tasks", [])) if isinstance(p, dict) else None,
                 "images": len(current_state.get("image_specs", []) or []),
                 "sections_done": len(current_state.get("sections", []) or []),
             }
@@ -439,7 +421,12 @@ if out:
                         "url": e.get("url"),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={"url": st.column_config.LinkColumn("url")},
+            )
 
     # --- Preview tab ---
     with tab_preview:

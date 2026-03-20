@@ -31,6 +31,9 @@ load_dotenv(dotenv_path=ROOT_DIR.parent / ".env")
 # ============================================================
 
 
+_TOGETHER_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell-Free"
+_TOGETHER_IMAGE_MAX_DIM = 1440
+
 # -----------------------------
 # 1) Schemas
 # -----------------------------
@@ -285,7 +288,10 @@ def research_node(state: State) -> dict:
                 content=(
                     f"As-of date: {state['as_of']}\n"
                     f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
+                    "Raw results:\n" + "\n".join(
+                        f"- {r.get('title','')} | {r.get('url','')} | {str(r.get('content',''))[:300]}"
+                        for r in raw[:15]
+                    )
                 )
             ),
         ]
@@ -304,7 +310,7 @@ def research_node(state: State) -> dict:
     if state.get("mode") == "open_book":
         as_of = date.fromisoformat(state["as_of"])
         cutoff = as_of - timedelta(days=int(state["recency_days"]))
-        evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
+        evidence = [e for e in evidence if not (d := _iso_to_date(e.published_at)) or d >= cutoff]
 
     return {"evidence": evidence}
 
@@ -323,6 +329,7 @@ Grounding:
 - hybrid: use evidence for up-to-date examples; mark those tasks requires_research=True and requires_citations=True.
 - open_book: weekly/news roundup:
   - Set blog_kind="news_roundup"
+  - Set requires_research=true and requires_citations=true on ALL tasks.
   - No tutorial content unless requested
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
@@ -350,7 +357,10 @@ def orchestrator_node(state: State) -> dict:
                     f"Mode: {mode}\n"
                     f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
                     f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                    f"Evidence:\n" + "\n".join(
+                        f"- {e.title} | {e.url} | {(e.snippet or '')[:200]}"
+                        for e in evidence[:8]
+                    )
                 )
             ),
         ]
@@ -394,7 +404,7 @@ def fanout(state: State):
                 "as_of": state["as_of"],
                 "recency_days": state["recency_days"],
                 "plan": state["plan"].model_dump(),
-                "evidence": [e.model_dump() for e in state.get("evidence", [])],
+                "evidence": [e.model_dump() for e in state.get("evidence", [])[:5]],
             },
         )
         for task in tasks
@@ -417,14 +427,14 @@ Scope guard:
 
 Grounding:
 - If mode=="open_book": do not introduce any specific event/company/model/funding/policy claim unless supported by provided Evidence URLs.
-  For each supported claim, attach a Markdown link ([Source](URL)).
-  If unsupported, write "Not found in provided sources."
+- For EVERY factual claim, cite using EXACT format: [Article Title](https://full-url-here.com)
+  Example: Predictive analytics improves outcomes [Top AI Trends in Healthcare](https://fptsoftware.com/resource-center/blogs/top-ai-trends-in-2026).
+  NEVER write (__Source__) or (Source) or [Source] — always use a real URL from the Evidence list.
+- If unsupported, omit the claim entirely.
 - If requires_citations==true (hybrid tasks): cite Evidence URLs for external claims.
-- If any Evidence URLs are provided, include at least 2 inline citations in the section body when making factual statements.
-- If Evidence URLs are provided, always end the section with:
+- Always end the section with:
   ### Sources
-  - [Short title](URL)
-  - [Short title](URL)
+  - [Article Title](https://full-url-here.com)
 
 Code:
 - If requires_code==true, include at least one minimal snippet.
@@ -434,11 +444,11 @@ def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
-    allowed_urls = {e.url.strip() for e in evidence if e.url and e.url.strip()}
+    allowed_normalized = {_normalize_url(e.url) for e in evidence if e.url and e.url.strip()}
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
     evidence_text = "\n".join(
-        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
+        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'} | {(e.snippet or '')[:200]}"
         for e in evidence[:20]
     )
 
@@ -474,9 +484,10 @@ def worker_node(payload: dict) -> dict:
 
     # Keep only citations that exist in retrieved evidence.
     def _replace_link(match: re.Match) -> str:
-        label = match.group(1)
         url = match.group(2).strip()
-        return match.group(0) if url in allowed_urls else f"{label} (source unavailable)"
+        if _normalize_url(url) in allowed_normalized:
+            return match.group(0)
+        return match.group(1) + " (source unavailable)"
 
     section_md = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _replace_link, section_md)
 
@@ -487,7 +498,7 @@ def worker_node(payload: dict) -> dict:
             sources_md = "\n".join(
                 f"- [{(e.title or 'Source')[:80]}]({e.url})"
                 for e in evidence[:3]
-                if e.url and e.url in allowed_urls
+                if e.url and _normalize_url(e.url) in allowed_normalized
             )
             if sources_md:
                 section_md = section_md.rstrip() + "\n\n### Sources\n" + sources_md
@@ -515,9 +526,9 @@ DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
 Decide if images/diagrams are needed for THIS blog.
 
 Rules:
-- Max 3 images total.
+- Max 1 image total.
 - Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
+- Insert placeholders exactly: [[IMAGE_1]].
 - If no images needed: md_with_placeholders must equal input and images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
 Return strictly GlobalImagePlan.
@@ -559,7 +570,7 @@ def decide_images(state: State) -> dict:
     # This avoids silent "no-image" outputs when the planner returns images=[].
     if not image_plan.images:
         approx_words = len(re.findall(r"\w+", merged_md))
-        if approx_words >= 700:
+        if approx_words >= 300:
             fallback_placeholder = "[[IMAGE_1]]"
             md_with_ph = merged_md
             if fallback_placeholder not in md_with_ph:
@@ -613,30 +624,28 @@ def decide_images(state: State) -> dict:
     }
 
 
-def _openai_generate_image_bytes(prompt: str, size: str = "1536x1024", quality: str = "medium") -> bytes:
-    """
-    Returns raw image bytes generated by OpenAI image API.
-    Requires: OPENAI_API_KEY
-    """
+def _openai_generate_image_bytes(prompt: str, size: str = "1024x1024", quality: str = "standard") -> bytes:
+    """Returns raw image bytes using OpenAI dall-e-2."""
     from openai import OpenAI
-
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-
+        raise RuntimeError("Set OPENAI_API_KEY in .env")
     client = OpenAI(api_key=api_key)
-    image_model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+    image_model = os.getenv("OPENAI_IMAGE_MODEL", "dall-e-2")
     resp = client.images.generate(
         model=image_model,
-        prompt=prompt,
-        size=size,
-        quality=quality,
+        prompt=prompt[:1000],
+        n=1,
+        size="1024x1024",
+        response_format="b64_json",
     )
-
     if not resp.data or not getattr(resp.data[0], "b64_json", None):
-        raise RuntimeError("No image bytes returned by OpenAI images API.")
-
+        raise RuntimeError("No image bytes returned.")
     return base64.b64decode(resp.data[0].b64_json)
+
+
+def _normalize_url(u: str) -> str:
+    return re.sub(r"^https?://", "", u.strip().rstrip("/").lower())
 
 
 def _safe_slug(title: str) -> str:
